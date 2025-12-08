@@ -1,0 +1,7 @@
+error: unexpected argument '--debug' found
+
+  tip: to pass '--debug' as a value, use '-- --debug'
+
+Usage: codex exec [OPTIONS] [PROMPT] [COMMAND]
+
+For more information, try '--help'.
