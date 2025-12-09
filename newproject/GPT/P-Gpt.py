@@ -28,7 +28,8 @@ from sklearn.metrics import (
     roc_curve, auc, precision_recall_curve, average_precision_score
 )
 from dataclasses import dataclass
-
+from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import roc_auc_score, average_precision_score
 # ======== M2AD statistical components ========
 from statistics import NormalDist
 from scipy.stats import gamma
@@ -36,12 +37,100 @@ from sklearn.mixture import GaussianMixture
 from functools import partial
 from itertools import compress
 
+import sys
+
+THIS_FILE = Path(__file__).resolve()
+# P-Gpt.py 在 D:\project\our\newproject\GPT
+# parents[0] = GPT, parents[1] = newproject, parents[2] = our
+ROOT_DIR = THIS_FILE.parents[2]   # D:\project\our
+
+# 把 D:\project\our 加到 sys.path 里
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# 现在就可以 from MTCL_UAV... 了
+from MTCL_UAV.layers.MoE import MoE
+from MTCL_UAV.layers.RevIN import RevIN
+
+# ======================================================================
+# 映射：测试集中每个 flight -> 对应的故障 IMU 行号（从 0 开始）
+# 你需要根据 ALFA 官方工具 / 自己整理的标注，把下面的字典填完整。
+# key 可以是文件名的一部分（子串匹配），value 是整数 fault_row。
+# ======================================================================
+FAULT_ROW_DICT = {
+    "carbonZ_2018-07-18-15-53-31_1_engine_failure": 286,
+    "carbonZ_2018-07-18-15-53-31_2_engine_failure": 187,
+    "carbonZ_2018-07-18-16-22-01_engine_failure_with_emr_traj": 288,
+    "carbonZ_2018-07-18-16-37-39_2_engine_failure_with_emr_traj": 279,
+    "carbonZ_2018-07-30-16-29-45_engine_failure_with_emr_traj": 311,
+    "carbonZ_2018-07-30-16-39-00_1_engine_failure": 294,
+    "carbonZ_2018-07-30-16-39-00_2_engine_failure": 234,
+    "carbonZ_2018-07-30-17-10-45_engine_failure_with_emr_traj": 300,
+    "carbonZ_2018-07-30-17-20-01_engine_failure_with_emr_traj": 218,
+    "carbonZ_2018-07-30-17-36-35_engine_failure_with_emr_traj": 330,
+    "carbonZ_2018-07-30-17-46-31_engine_failure_with_emr_traj": 224,
+    "carbonZ_2018-09-11-11-56-30_engine_failure": 264,
+    "carbonZ_2018-09-11-14-22-07_1_engine_failure": 256,
+    "carbonZ_2018-09-11-14-22-07_2_engine_failure": 124,
+    "carbonZ_2018-09-11-14-41-51_elevator_failure": 299,
+    "carbonZ_2018-09-11-14-52-54_left_aileron__right_aileron__failure": 256,
+    "carbonZ_2018-09-11-15-05-11_1_elevator_failure": 164,
+    "carbonZ_2018-09-11-15-06-34_1_rudder_right_failure": 140,
+    "carbonZ_2018-09-11-15-06-34_2_rudder_right_failure": 133,
+    "carbonZ_2018-09-11-15-06-34_3_rudder_left_failure": 155,
+    "carbonZ_2018-09-11-17-27-13_1_rudder_zero__left_aileron_failure": 299,
+    "carbonZ_2018-09-11-17-27-13_2_both_ailerons_failure": 169,
+    "carbonZ_2018-09-11-17-55-30_1_right_aileron_failure": 287,
+    "carbonZ_2018-09-11-17-55-30_2_left_aileron_failure": 125,
+    "carbonZ_2018-10-05-14-34-20_2_right_aileron_failure_with_emr_traj": 383,
+    "carbonZ_2018-10-05-14-37-22_2_right_aileron_failure": 191,
+    "carbonZ_2018-10-05-14-37-22_3_left_aileron_failure": 188,
+    "carbonZ_2018-10-05-15-52-12_3_engine_failure_with_emr_traj": 128,
+    "carbonZ_2018-10-05-15-55-10_engine_failure_with_emr_traj": 257,
+    "carbonZ_2018-10-05-16-04-46_engine_failure_with_emr_traj": 193,
+    "carbonZ_2018-10-18-11-03-57_engine_failure_with_emr_traj": 269,
+    "carbonZ_2018-10-18-11-04-00_engine_failure_with_emr_traj": 284,
+    "carbonZ_2018-10-18-11-04-08_1_engine_failure_with_emr_traj": 253,
+    "carbonZ_2018-10-18-11-04-08_2_engine_failure_with_emr_traj": 248,
+    "carbonZ_2018-10-18-11-04-35_engine_failure_with_emr_traj": 256,
+    "carbonZ_2018-10-18-11-06-06_engine_failure_with_emr_traj": 266,
+}
+
+
+def get_fault_row_for_file(file_path: Path):
+    """根据文件名子串在 FAULT_ROW_DICT 中查找故障行号。找不到则返回 None。"""
+    s = str(file_path)
+    for key, row in FAULT_ROW_DICT.items():
+        if key in s:
+            return row
+    return None
+
 
 # ==================== 1. 数据集定义 ====================
+# ==================== 1. 数据集定义（支持分类标签） ====================
 class ALFADataset(Dataset):
-    def __init__(self, file_paths, mode='train', scaler=None, L=50, H=20):
+    def __init__(
+        self,
+        file_paths,
+        mode: str = 'train',
+        scaler: StandardScaler = None,
+        L: int = 50,
+        H: int = 20,
+        return_label: bool = False,
+    ):
+        """
+        file_paths : 一组 mavros-imu-data.csv 的路径
+        mode       : 'train' / 'test'，这里只用于日志，缩放逻辑只看 scaler 是否为 None
+        scaler     : 若为 None，则在 full_data 上 fit；否则直接使用传入的 scaler
+        L, H       : 历史长度和预测长度
+        return_label:
+            False -> __getitem__ 返回 (C_seq, Y_seq)
+            True  -> __getitem__ 返回 (C_seq, Y_seq, y_cls)，其中 y_cls 为标量 0/1
+        """
         self.L = L
         self.H = H
+        self.return_label = return_label
+
         # 10 维传感器特征，每一维视为一个独立传感器
         self.features = [
             'orientation.x', 'orientation.y', 'orientation.z', 'orientation.w',
@@ -49,8 +138,11 @@ class ALFADataset(Dataset):
             'angular_velocity.x', 'angular_velocity.y', 'angular_velocity.z'
         ]
 
+        self.file_paths = [Path(p) for p in file_paths]
+
+        # 先把所有 flight 的原始数据读出来
         raw_data_list = []
-        for file in file_paths:
+        for file in self.file_paths:
             df = pd.read_csv(file)
             if not set(self.features).issubset(df.columns):
                 continue
@@ -62,30 +154,72 @@ class ALFADataset(Dataset):
 
         full_data = np.concatenate(raw_data_list, axis=0)
 
-        if mode == 'train':
+        # 统一用 full_data 拟合/复用 scaler，保证与之前逻辑一致
+        if scaler is None:
+            # 仅在第一次构造（训练集）时拟合
             self.scaler = StandardScaler()
-            self.normalized_data = self.scaler.fit_transform(full_data)
+            self.scaler.fit(full_data)
         else:
-            assert scaler is not None, "Test mode requires a fitted scaler!"
             self.scaler = scaler
-            self.normalized_data = self.scaler.transform(full_data)
 
-        self.data = torch.tensor(self.normalized_data, dtype=torch.float32)
-        self.valid_indices = len(self.data) - (self.L + self.H)
+        # 对每个 flight 单独做 transform，保留边界，用于构造「不跨 flight」的窗口
+        self.seqs = []          # list of [N_f, D] 的 tensor，每个 flight 一条
+        self.lengths = []       # 每个 flight 的长度
+        for data_chunk in raw_data_list:
+            norm_chunk = self.scaler.transform(data_chunk)
+            tensor_chunk = torch.tensor(norm_chunk, dtype=torch.float32)
+            self.seqs.append(tensor_chunk)
+            self.lengths.append(tensor_chunk.shape[0])
+
+        # 为每个 flight 构造滑动窗口起点 (file_idx, start_row_local)，不跨 flight
+        self.samples = []       # list of (file_idx, start_row_local)
+        for f_idx, N in enumerate(self.lengths):
+            max_start = N - (self.L + self.H)
+            if max_start <= 0:
+                continue
+            for start in range(max_start):
+                self.samples.append((f_idx, start))
 
     def __len__(self):
-        return max(0, self.valid_indices)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        hist_end = idx + self.L
+        """
+        返回:
+          return_label=False:  C_seq [L,D], Y_seq [H,D]
+          return_label=True :  C_seq [L,D], Y_seq [H,D], y_cls [标量 0/1]
+        """
+        file_idx, start = self.samples[idx]
+        seq = self.seqs[file_idx]               # [N_f, D]
+        hist_end = start + self.L
         future_end = hist_end + self.H
 
-        C_seq = self.data[idx: hist_end]         # [L, D]
-        Y_seq = self.data[hist_end: future_end]  # [H, D]
-        return C_seq, Y_seq
+        C_seq = seq[start: hist_end]           # [L, D]
+        Y_seq = seq[hist_end: future_end]      # [H, D]
+
+        if not self.return_label:
+            return C_seq, Y_seq
+
+        # ---------- 计算该窗口的二分类标签 ----------
+        file_path = self.file_paths[file_idx]
+        fault_row = get_fault_row_for_file(file_path)
+
+        if fault_row is None:
+            # 没有标注的 flight，一律当作正常（纯负样本）
+            label = 0.0
+        else:
+            # 窗口未来 H 步对应的原始行号（在该 flight 内是局部 0-based）
+            future_rows = np.arange(hist_end, future_end)
+            # 只要未来窗口中出现任何 >= fault_row 的行号，就标记为正
+            label = float(np.any(future_rows >= fault_row))
+
+        y_cls = torch.tensor(label, dtype=torch.float32)
+
+        return C_seq, Y_seq, y_cls
 
     def get_scaler(self):
         return self.scaler
+
 
 
 # ==================== 2. Diffusion 基础组件 ====================
@@ -181,24 +315,141 @@ class GaussianDiffusionSchedule(nn.Module):
 
 
 # ==================== 3. Transformer + Diffusion 架构 ====================
-class CondEncoder(nn.Module):
-    def __init__(self, d_in, d_model, num_layers=2, num_heads=4,
-                 dim_ff=256, max_len=512):
-        super().__init__()
-        self.input_proj = nn.Linear(d_in, d_model)
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len=max_len)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads,
-            dim_feedforward=dim_ff, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer,
-                                             num_layers=num_layers)
+class AMSCondEncoder(nn.Module):
+    """
+    条件编码器：使用 MTCL_UAV 的 AMS 结构 (RevIN + 多层 MoE) 对历史序列 C 进行特征提取。
 
-    def forward(self, cond_seq):
-        x = self.input_proj(cond_seq)
-        x = self.pos_enc(x)
-        h = self.encoder(x)
-        return h  # [B, L, d_model]
+    输入:
+        C : [B, L, D]  (L=历史长度, D=传感器数=10)
+
+    输出:
+        cond_seq       : [B, L, d_model]  作为 Diffusion 的 cross-attn key/value
+        balance_loss   : 标准 MoE load-balance 正则 (累加所有层)
+        contrast_loss  : AMS 中所有层的对比学习损失平均值
+    """
+    def __init__(
+        self,
+        num_nodes: int,
+        seq_len: int,
+        d_model: int = 128,
+        d_ff: int = 256,
+        layer_nums: int = 2,
+        k: int = 2,
+        num_experts_list=None,
+        patch_size_list=None,
+        residual_connection: bool = True,
+        use_revin: bool = True,
+        batch_norm: bool = True,
+        temp: float = 2.0,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__()
+        self.num_nodes = num_nodes      # = D_cond = 10
+        self.seq_len = seq_len          # = L
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.layer_nums = layer_nums
+        self.k = k
+        self.residual_connection = int(residual_connection)
+        self.batch_norm = batch_norm
+        self.temp = temp
+        self.device = device
+
+        # 1) RevIN: 按 feature 维度做归一化（与 MTCL 一致）
+        self.revin = RevIN(
+            num_features=self.num_nodes,
+            affine=False,
+            subtract_last=False
+        ) if use_revin else None
+
+        # 2) 起始线性层: 把每个传感器的一维值映射到 d_model
+        #    输入形状为 [B, L, D, 1] -> 输出 [B, L, D, d_model]
+        self.start_fc = nn.Linear(in_features=1, out_features=self.d_model)
+
+        # 3) AMS: 多层 MoE，每层上面挂多个 “patch 尺度” 的专家
+        if num_experts_list is None:
+            num_experts_list = [4] * layer_nums  # 每层 4 个专家
+        assert len(num_experts_list) == layer_nums
+
+        # patch_size_list 形状: [layer_nums, n_patches_per_layer]
+        # 如果没给，就按 MTCL 的风格构造一个多尺度列表
+        if patch_size_list is None:
+            # 这里简单生成几种尺度，保证 <= seq_len
+            base_patches = [16, 12, 8, 4]
+            patch_size_list = []
+            for li in range(layer_nums):
+                scales = [max(2, min(self.seq_len, p // (2**li)))
+                          for p in base_patches]
+                patch_size_list.append(scales)
+        else:
+            # 支持传入 flat list（和 MTCL run.py 一样 reshape）
+            if isinstance(patch_size_list[0], int):
+                # e.g. [16, 12, 8, 32, 12, 8, 6, 4, ...]
+                patch_size_list = np.array(patch_size_list).reshape(
+                    layer_nums, -1
+                ).tolist()
+
+        self.ams_layers = nn.ModuleList()
+        for li in range(layer_nums):
+            ams = MoE(
+                input_size=self.seq_len,
+                output_size=self.seq_len,
+                num_experts=num_experts_list[li],
+                device=self.device,
+                num_nodes=self.num_nodes,
+                d_model=self.d_model,
+                d_ff=self.d_ff,
+                dynamic=False,
+                patch_size=patch_size_list[li],
+                noisy_gating=True,
+                k=self.k,
+                layer_number=li + 1,
+                residual_connection=self.residual_connection,
+                batch_norm=self.batch_norm,
+                temp=self.temp,
+            )
+            self.ams_layers.append(ams)
+
+    def forward(self, C: torch.Tensor):
+        """
+        C: [B, L, D]
+        返回:
+            cond_seq      : [B, L, d_model]
+            balance_loss  : scalar 张量
+            contrast_loss : scalar 张量
+        """
+        x = C  # [B, L, D]
+
+        # 1) RevIN 归一化（与 MTCL 一致）
+        if self.revin is not None:
+            x = self.revin(x, mode='norm')  # [B, L, D]
+
+        # 2) 映射到 AMS 的输入形状 [B, L, D, d_model]
+        #    先在最后添一维，再通过全连接层
+        out = self.start_fc(x.unsqueeze(-1))  # [B, L, D, d_model]
+
+        balance_total = out.new_tensor(0.0)
+        contrast_list = []
+
+        # 3) 逐层 AMS (MoE)
+        for ams in self.ams_layers:
+            # MoE.forward(out) -> (out, balance_loss, contrast_loss)
+            out, bal_loss, con_loss = ams(out)
+            balance_total = balance_total + bal_loss
+            contrast_list.append(con_loss)
+
+        # 4) 对所有专家层的对比损失求平均
+        if len(contrast_list) > 0:
+            contrast_loss = torch.stack(contrast_list).mean()
+        else:
+            contrast_loss = out.new_tensor(0.0)
+
+        # 5) 融合 10 个 IMU 传感器：对 sensor 维度做平均池化
+        #    out: [B, L, D, d_model] -> [B, L, d_model]
+        cond_seq = out.mean(dim=2)
+
+        return cond_seq, balance_total, contrast_loss
+
 
 
 class FutureBackbone(nn.Module):
@@ -219,49 +470,119 @@ class FutureBackbone(nn.Module):
 
 
 class UAVDiffusionModel(nn.Module):
-    def __init__(self, D_cond, D_target, diffusion_cfg,
-                 d_model_cond=128, d_model_future=128):
+    def __init__(
+        self,
+        D_cond,
+        D_target,
+        diffusion_cfg,
+        L_hist: int,
+        ams_cfg: dict = None,
+        d_model_future: int = 128,
+    ):
+        """
+        D_cond   : 条件维度 (10)
+        D_target : 预测维度 (10)
+        L_hist   : 历史长度 L，用于 AMS 的 seq_len
+        ams_cfg  : dict 中可以覆盖 AMSCondEncoder 的默认超参
+        """
         super().__init__()
         self.D_cond = D_cond
         self.D_target = D_target
 
-        self.cond_encoder = CondEncoder(D_cond, d_model_cond)
+        if ams_cfg is None:
+            ams_cfg = {}
+
+        device = ams_cfg.get("device", torch.device("cpu"))
+
+
+
+        # ========= 1) 用 AMSCondEncoder 替代原 CondEncoder =========
+        self.cond_encoder = AMSCondEncoder(
+            num_nodes=D_cond,
+            seq_len=L_hist,
+            d_model=ams_cfg.get("d_model", d_model_future),
+            d_ff=ams_cfg.get("d_ff", 256),
+            layer_nums=ams_cfg.get("layer_nums", 2),
+            k=ams_cfg.get("k", 2),
+            num_experts_list=ams_cfg.get("num_experts_list", [4, 4]),
+            patch_size_list=ams_cfg.get("patch_size_list", None),
+            residual_connection=ams_cfg.get("residual_connection", True),
+            use_revin=ams_cfg.get("use_revin", True),
+            batch_norm=ams_cfg.get("batch_norm", True),
+            temp=ams_cfg.get("temp", 2.0),
+            device=device,
+        )
+
+        d_model_future = ams_cfg.get("d_model", d_model_future)
+
+        # ========= 2) 时间步嵌入 (DDPM) =========
         self.time_embed = TimeEmbedding(diffusion_cfg.num_steps,
                                         d_model_future)
 
-        # 输入: [Y_t, self_cond] 维度翻倍
+        # ========= 3) 未来轨迹分支 (和你原来一致) =========
+        # 输入: [Y_t, self_cond] -> d_model_future
         self.future_proj = nn.Linear(D_target * 2, d_model_future)
 
-        # Cross-Attention: future query history
+        # Cross-Attention: future query 历史 AMS 特征
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model_future, num_heads=4, batch_first=True
+            embed_dim=d_model_future,
+            num_heads=4,
+            batch_first=True
         )
         self.norm1 = nn.LayerNorm(d_model_future)
 
+        # Transformer backbone in future domain
         self.future_backbone = FutureBackbone(d_model=d_model_future)
         self.out_proj = nn.Linear(d_model_future, D_target)
+        # ======== 4) 时序二分类头 (MTCL 风格的 task-level 分支) ========
+        # 这里采用一个简单策略：用 AMS 编码后的历史序列 cond_seq 的最后一个时间步
+        # 作为「当前时刻」的表示，然后接一个二分类 head。
+        self.cls_head = nn.Sequential(
+            nn.LayerNorm(d_model_future),
+            nn.Linear(d_model_future, 1)   # 输出 logit 标量
+        )
 
-    def forward(self, C, Y_t, t, self_cond=None):
-        # 1. 编码历史 -> [B, L, d]
-        cond_seq = self.cond_encoder(C)
+    def forward(self, C, Y_t, t, self_cond=None, return_aux: bool = False):
+        """
+        C       : [B, L, D]
+        Y_t     : [B, H, D]
+        t       : [B]  时间步
+        self_cond : [B, H, D] 或 None
+        return_aux: True 时返回 (eps_pred, balance_loss, contrast_loss, cls_logits)
+        """
+        # 1) AMS 编码历史（结构级融合）
+        cond_seq, balance_loss, contrast_loss = self.cond_encoder(C)
+        # cond_seq: [B, L, d_model_future]
 
-        # 2. Self-Conditioning
+        # 2) self-conditioning
         if self_cond is None:
             self_cond = torch.zeros_like(Y_t)
 
-        # 3. 拼接未来输入
+        # 3) 未来分支输入
         x_in = torch.cat([Y_t, self_cond], dim=-1)  # [B, H, 2D]
-        future_emb = self.future_proj(x_in)         # [B, H, d]
-        t_emb = self.time_embed(t).unsqueeze(1)     # [B, 1, d]
-        query = future_emb + t_emb                  # [B, H, d]
+        future_emb = self.future_proj(x_in)  # [B, H, d_model]
 
-        # 4. Cross-Attention
+        # 4) 时间步嵌入
+        t_emb = self.time_embed(t).unsqueeze(1)  # [B, 1, d_model]
+        query = future_emb + t_emb  # [B, H, d_model]
+
+        # 5) Cross-Attention: query=未来，key/value=AMS 历史
         attn_out, _ = self.cross_attn(query, cond_seq, cond_seq)
         x = self.norm1(query + attn_out)
 
-        # 5. Transformer backbone & 输出噪声预测
+        # 6) 未来 Transformer backbone & 噪声预测
         h = self.future_backbone(x)
-        return self.out_proj(h)
+        eps_pred = self.out_proj(h)  # [B, H, D_target]
+
+        # 7) 时序二分类 head：使用 cond_seq 的最后一个时间步作为 summary
+        #    cls_feat: [B, d_model_future], cls_logits: [B]
+        cls_feat = cond_seq[:, -1, :]  # 取历史最后一个时刻
+        cls_logits = self.cls_head(cls_feat).squeeze(-1)
+
+        if return_aux:
+            return eps_pred, balance_loss, contrast_loss, cls_logits
+        else:
+            return eps_pred
 
 
 # ==================== 4. Diffusion 训练 / 采样 ====================
@@ -274,31 +595,79 @@ def predict_x0_from_xt(schedule, xt, eps_pred, t):
     return (xt - sqrt_one_minus * eps_pred) / sqrt_alpha_bar
 
 
-def training_step(model, schedule, C_batch, Y0_batch, optimizer, device):
-    """标准 DDPM 训练步 + Self-conditioning"""
+def training_step(
+    model,
+    schedule,
+    C_batch,
+    Y0_batch,
+    optimizer,
+    device,
+    lambda_balance: float = 1.0,
+    lambda_contrast: float = 0.1,
+    lambda_cls: float = 1.0,
+    y_cls: torch.Tensor = None,
+):
+    """
+    标准 DDPM 训练步 + AMS 的 load-balance & contrastive 正则 + 时序二分类任务
+
+    总损失:
+        L = L_diffusion + λ_b * L_balance + λ_c * L_contrast + λ_cls * L_cls
+
+    其中:
+        L_diffusion = E[||eps_pred - eps||^2]
+        L_cls       = BCEWithLogits(cls_logits, y_cls)
+    """
     model.train()
-    C_batch = C_batch.to(device)
-    Y0_batch = Y0_batch.to(device)
+    C_batch = C_batch.to(device)    # [B, L, D]
+    Y0_batch = Y0_batch.to(device)  # [B, H, D]
     B = Y0_batch.size(0)
 
+    # 随机时间步
     t = torch.randint(0, schedule.num_steps, (B,), device=device).long()
     eps = torch.randn_like(Y0_batch)
     Y_t = schedule.q_sample(Y0_batch, t, eps)
 
-    # 50% 概率使用真实 Y0 作为 self-cond
+    # 50% 概率使用真实 Y0 作为 self-conditioning
     if torch.rand(1) < 0.5:
         with torch.no_grad():
             self_cond = Y0_batch
     else:
         self_cond = torch.zeros_like(Y0_batch)
 
-    eps_pred = model(C_batch, Y_t, t, self_cond)
-    loss = F.mse_loss(eps_pred, eps)
+    # ===== 调用 Joint backbone (带 AMS 辅助损失 + 分类 logit) =====
+    eps_pred, balance_loss, contrast_loss, cls_logits = model(
+        C_batch, Y_t, t, self_cond, return_aux=True
+    )
+
+    # 1) Diffusion 噪声回归损失
+    diff_loss = F.mse_loss(eps_pred, eps)
+
+    # 2) 分类损失（若提供标签）
+    if (y_cls is not None) and (lambda_cls > 0.0):
+        y_cls = y_cls.to(device)              # [B]
+        cls_loss = F.binary_cross_entropy_with_logits(cls_logits, y_cls)
+    else:
+        cls_loss = torch.tensor(0.0, device=device)
+
+    # 3) Joint loss
+    loss = diff_loss \
+           + lambda_balance * balance_loss \
+           + lambda_contrast * contrast_loss \
+           + lambda_cls * cls_loss
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    return loss.item()
+
+    # 方便监控：把四个子项都返回
+    return {
+        "loss_total":    loss.item(),
+        "loss_diff":     diff_loss.item(),
+        "loss_balance":  balance_loss.item(),
+        "loss_contrast": contrast_loss.item(),
+        "loss_cls":      cls_loss.item(),
+    }
+
 
 
 @torch.no_grad()
@@ -513,8 +882,8 @@ def area_errors(y, pred, score_window=10, dx=1.0,
 
         errors[:, i] = error.flatten()
 
-    mu = np.mean(errors)
-    std = np.std(errors) + 1e-8
+    mu = np.mean(errors, axis=0, keepdims=True)
+    std = np.std(errors, axis=0, keepdims=True) + 1e-8
     return (errors - mu) / std
 
 
@@ -699,26 +1068,59 @@ def detect_with_diffusion_gmm(model, schedule, loader, device,
     return results
 
 
+def tune_gamma_by_f1(y_true, gamma_p_val):
+    """
+    Oracle thresholding: pick gamma p-value (via score=-log10 p) maximizing F1.
+    返回:
+        best_gamma, best_f1, best_precision, best_recall
+    """
+    scores = -np.log10(gamma_p_val + 1e-16)
+    precision, recall, thresholds = precision_recall_curve(y_true, scores)
+
+    # thresholds 长度比 precision/recall 少 1，所以只对前 len(thresholds) 个点算 F1
+    p = precision[:-1]
+    r = recall[:-1]
+    f1 = 2 * p * r / (p + r + 1e-8)
+
+    best_idx = np.nanargmax(f1)
+    best_score = thresholds[best_idx]
+    best_gamma = 10 ** (-best_score)
+
+    return best_gamma, f1[best_idx], p[best_idx], r[best_idx]
+
+
 # ==================== 7. 主流程：训练 / 校准 / 测试 ====================
 def main_alfa():
-    device = torch.device('xpu' if torch.xpu.is_available()
-                          else 'cuda' if torch.cuda.is_available()
-                          else 'cpu')
+    # -------------------- 设备与超参数 --------------------
+    # device = torch.device('xpu' if torch.xpu.is_available()
+    #                       else 'cuda' if torch.cuda.is_available()
+    #                       else 'cpu')
+    # print(f"Using device: {device}")
+    # 优先用 CUDA，其次 CPU，不再使用 XPU，避免 UR_RESULT_ERROR_OUT_OF_RESOURCES
+    # if torch.cuda.is_available():
+    #     device = torch.device('cuda')
+    # else:
+    #     device = torch.device('cpu')
+    # print(f"Using device: {device}")
+    # 优先用 CUDA:0，其次 CPU，不再使用 XPU
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+    else:
+        device = torch.device('cpu')
     print(f"Using device: {device}")
+    pin_memory = (device.type == 'cuda')
 
-    # 序列长度
+    # 序列长度与维度
     L, H = 50, 20
     D_cond, D_target = 10, 10
-    train_epochs = 30
 
-    # 当前文件 P-Codex.py 的绝对路径
+    train_epochs = 300
+    diffusion_steps = 1000
+
+    # -------------------- 路径配置 --------------------
     THIS_FILE = Path(__file__).resolve()
-
-    # 仓库根目录: D:\project\our
-    ROOT_DIR = THIS_FILE.parents[2]  # Codex -> newproject -> our
-
+    ROOT_DIR = THIS_FILE.parents[2]        # OurProject 根目录
     DATA_ROOT = ROOT_DIR / "data" / "alfa"
-
     train_dir = DATA_ROOT / "train"
     test_dir = DATA_ROOT / "test"
 
@@ -731,204 +1133,346 @@ def main_alfa():
     if not test_files:
         raise RuntimeError(f"Error: No test files found in {test_dir}")
 
-    if not train_files:
-        print("Error: No train files found.")
-        return
+    print(f"Found {len(train_files)} train files, {len(test_files)} test files.")
+    # -------- 只挑 2 条带故障的 test flight 做调试 --------
+    # 利用 FAULT_ROW_DICT 的 key 来判断“带故障”的 flight
+    faulty_test_files = []
+    for f in test_files:
+        s = str(f)
+        if any(key in s for key in FAULT_ROW_DICT.keys()):
+            faulty_test_files.append(f)
 
-    if not train_files:
-        print("Error: No train files found.")
-        return
-    if not test_files:
-        print("Warning: No test files found.")
-        return
+    # 去重并只保留前两条
+    faulty_test_files = list(dict.fromkeys(faulty_test_files))
+    if len(faulty_test_files) == 0:
+        raise RuntimeError("No faulty test flights found that match FAULT_ROW_DICT keys.")
+    test_files = faulty_test_files[:1]
 
-    # ---------- 数据集 ----------
-    print("Loading Data.")
-    train_dataset = ALFADataset(train_files, mode='train', L=L, H=H)
+    print("Debug mode: using only 1 faulty test flights:")
+    for f in test_files:
+        print("  ", f)
+
+
+    # -------------------- 数据集与 DataLoader --------------------
+    print("Loading train data and fitting scaler...")
+
+    # 1) 训练用：需要分类标签
+    train_dataset = ALFADataset(
+        train_files,
+        mode='train',
+        scaler=None,
+        L=L,
+        H=H,
+        return_label=True,  # 关键：返回 y_cls
+    )
     scaler = train_dataset.get_scaler()
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
-                              num_workers=0)
 
-    # 测试用单文件（也可以遍历所有 test_files）
-    test_file = test_files[0]
-    print(f"Testing on: {test_file}")
-    test_dataset = ALFADataset([test_file], mode='test', scaler=scaler,
-                               L=L, H=H)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False,
-                             num_workers=0)
+    train_loader = DataLoader(
+        train_dataset, batch_size=32, shuffle=True, num_workers=0,
+        pin_memory=pin_memory
+    )
 
-    # ---------- 模型与 Diffusion ----------
-    cfg = DiffusionConfig(num_steps=1000)
+    # 2) 校准 / 检测用：不需要标签，只要 (C_seq, Y_seq)
+    calib_dataset = ALFADataset(
+        train_files,
+        mode='train',
+        scaler=scaler,  # 复用同一个 scaler
+        L=L,
+        H=H,
+        return_label=False,
+    )
+
+    # -------------------- 模型与 Diffusion + AMS Joint Backbone --------------------
+    cfg = DiffusionConfig(num_steps=diffusion_steps)
     schedule = GaussianDiffusionSchedule(cfg).to(device)
-    model = UAVDiffusionModel(D_cond, D_target, cfg).to(device)
+
+    ams_cfg = {
+        "device": device,
+        "d_model": 128,
+        "d_ff": 256,
+        "layer_nums": 2,
+        "k": 2,
+        "num_experts_list": [4, 4],
+        # 显式指定 patch_size_list：每层 [10, 5, 2, 1]
+        # 注意：这是 flat list，AMSCondEncoder 内部会 reshape 成 (2, 4)
+        "patch_size_list": [10, 5, 2, 1, 10, 5, 2, 1],
+        "residual_connection": True,
+        "use_revin": True,
+        "batch_norm": True,
+        "temp": 2.0,
+    }
+
+    model = UAVDiffusionModel(
+        D_cond=D_cond,
+        D_target=D_target,
+        diffusion_cfg=cfg,
+        L_hist=L,  # 这里用历史长度 L=50
+        ams_cfg=ams_cfg,
+        d_model_future=ams_cfg["d_model"],
+    ).to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    # ---------- 训练 or 加载 ----------
     model_path = "uav_imputation_model.pth"
 
+    # -------------------- Phase 1: 训练或加载模型 --------------------
     if os.path.exists(model_path):
         print("\n>>> Phase 1: Loading pre-trained Diffusion model.")
         model.load_state_dict(torch.load(model_path, map_location=device))
         print(f"Loaded '{model_path}'.")
     else:
-        print("\n>>> Phase 1: Training Diffusion model from scratch.")
+        print("\n>>> Phase 1: Training Diffusion+AMS+Classifier joint model from scratch.")
         for epoch in range(train_epochs):
             total_loss = 0.0
-            for C_batch, Y_batch in train_loader:
-                loss = training_step(model, schedule, C_batch, Y_batch,
-                                     optimizer, device)
-                total_loss += loss
-            print(f"Epoch {epoch + 1}/{train_epochs}, "
-                  f"Avg Loss: {total_loss / len(train_loader):.6f}")
-
+            for C_batch, Y_batch, y_cls in train_loader:
+                stats = training_step(
+                    model,
+                    schedule,
+                    C_batch,
+                    Y_batch,
+                    optimizer,
+                    device,
+                    lambda_balance=1.0,
+                    lambda_contrast=0.1,
+                    lambda_cls=0.5,  # 你可以之后调这个权重
+                    y_cls=y_cls,
+                )
+                total_loss += stats["loss_total"]
+            print(
+                f"Epoch {epoch + 1}/{train_epochs}, "
+                f"Avg Loss: {total_loss / len(train_loader):.6f}"
+            )
         torch.save(model.state_dict(), model_path)
         print(f"Saved trained model to '{model_path}'.")
 
     model.eval()
 
-    # ---------- Phase 2: 使用 M2AD 风格 AREA 误差进行阈值标定 ----------
+    # -------------------- Phase 2: M2AD 风格 GMM + Gamma 校准 --------------------
     print("\n>>> Phase 2: Calibrating GMM + Gamma on normal-like train data.")
-    calib_loader = DataLoader(train_dataset, batch_size=32, shuffle=False,
-                              num_workers=0)
+    calib_loader = DataLoader(
+        train_dataset, batch_size=32, shuffle=False, num_workers=0,
+        pin_memory=pin_memory
+    )
 
-    # 这里切换为 area 误差
-    error_name = 'area'
-    gamma_thresh = 1e-3  # 完全沿用 M2AD 的 gamma 阈值
+    error_name = 'area'  # 使用 AREA 误差
 
     gmm_model, fisher_thresh, calib_stats = fit_gmm_on_diffusion_errors(
         model=model,
         schedule=schedule,
         loader=calib_loader,
         device=device,
-        sensors=train_dataset.features,  # 10 个传感器
+        sensors=train_dataset.features,   # 10 个传感器
         error_name=error_name,
         n_components=1,
         covariance_type='spherical',
         score_window=10,
         smoothing_window=10,
     )
-    print(f"[Threshold] Using gamma_thresh={gamma_thresh:.1e} as anomaly threshold on p-values.")
 
-    # ---------- Phase 3: 测试检测 ----------
-    print("\n>>> Phase 3: Detection on test file.")
-    det_results = detect_with_diffusion_gmm(
-        model=model,
-        schedule=schedule,
-        loader=test_loader,
-        device=device,
-        gmm_model=gmm_model,
-        error_name=error_name,
-        gamma_thresh=gamma_thresh,
-        score_window=10,
-        smoothing_window=10,
-    )
+    calib_errors, calib_gamma_pval, calib_fisher = calib_stats
+    # 在“正常”校准数据上希望的假报警率（可尝试多档）
+    target_fprs = [0.001, 0.005, 0.01, 0.02, 0.05, 0.10]    # 0.1% / 0.5% / 1%
+    gamma_thresh_list = [
+        (fpr, np.quantile(calib_gamma_pval, fpr)) for fpr in target_fprs
+    ]
+    gamma_thresh_default = gamma_thresh_list[len(gamma_thresh_list) // 2][1]
 
-    gamma_p_val = det_results["gamma_p_val"]
-    anomalies_bool = det_results["anomalies_bool"]
-    p_val_sensors = det_results["p_val_sensors"]
+    print(f"[Calibration] 99.5% Fisher threshold (diagnostic only): "
+          f"{fisher_thresh:.4f}")
+    for fpr, gthr in gamma_thresh_list:
+        print(f"[Threshold] Auto-calibrated gamma_thresh={gthr:.3e} "
+              f"(target FPR={fpr:.3%} on calibration data)")
 
-    # 将 p-value 转成「分数」，便于可视化：score = -log10(p)
-    scores_global = -np.log10(gamma_p_val + 1e-16)
-    score_threshold = -np.log10(gamma_thresh)
+    # -------------------- Phase 3: 在 test 上逐 flight 检测与评估 --------------------
+    all_metrics = {fpr: [] for fpr, _ in gamma_thresh_list}
 
-    # --------- 构造 Ground Truth（和原 p-gemini 简单逻辑保持一致）---------
-    num_steps = len(scores_global)
-    y_true = np.zeros(num_steps, dtype=int)
+    print("\n>>> Phase 3: Detection on test flights.")
+    for test_file in test_files:
+        print("\n" + "#" * 80)
+        print(f"[Test Flight] {test_file}")
+        print("#" * 80)
 
-    # 需要根据具体文件调整 failure_start_index
-    failure_start_index = 100
-    if "failure" in test_file or "carbon" in test_file:
-        y_true[failure_start_index:] = 1
-        print(f"[Ground Truth] Failure marked starting at index {failure_start_index}")
-    else:
-        print("[Ground Truth] Normal flight assumed (no failure label in filename).")
+        # 构建该 flight 的 Dataset / DataLoader
+        test_dataset = ALFADataset(
+            [test_file], mode='test', scaler=scaler, L=L, H=H
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=1, shuffle=False, num_workers=0,
+            pin_memory=pin_memory
+        )
 
-    y_pred = anomalies_bool.astype(int)
+        # ---- 检测 ----
+        det_results = detect_with_diffusion_gmm(
+            model=model,
+            schedule=schedule,
+            loader=test_loader,
+            device=device,
+            gmm_model=gmm_model,
+            error_name=error_name,
+            gamma_thresh=gamma_thresh_default,
+            score_window=10,
+            smoothing_window=10,
+        )
 
-    # ---------- Overall 指标 ----------
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
+        gamma_p_val = det_results["gamma_p_val"]
+        p_val_sensors = det_results["p_val_sensors"]
 
-    print("\n" + "=" * 60)
-    print("Global Performance Report (M2AD-area scoring on Diffusion backbone)")
-    print("=" * 60)
-    print(f"Accuracy  : {acc:.2%}")
-    print(f"Precision : {prec:.2%}")
-    print(f"Recall    : {rec:.2%}")
-    print(f"F1 Score  : {f1:.4f}")
-    print("=" * 60)
+        scores_global = -np.log10(gamma_p_val + 1e-16)
+        score_threshold = -np.log10(gamma_thresh_default)
 
-    # ---------- 全局分数可视化 ----------
-    window_size = 5
-    smoothed_scores = pd.Series(scores_global).rolling(
-        window=window_size, min_periods=1
-    ).mean().values
+        num_steps = len(scores_global)
+        H_forecast = test_dataset.H
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(scores_global, label='Raw Score (-log10 p_gamma)')
-    plt.plot(smoothed_scores, linewidth=2,
-             label=f'Smoothed Score (MA={window_size})')
-    plt.axhline(score_threshold, linestyle='--',
-                label=f'Threshold (-log10 {gamma_thresh:.0e})')
+        # ---- 构造 Ground Truth：根据 fault_row 映射 flatten index -> 原始 IMU 行号 ----
+        fault_row = get_fault_row_for_file(Path(test_file))
+        if fault_row is None:
+            # 如果没有标注，默认视作纯正常飞行
+            y_true = np.zeros(num_steps, dtype=int)
+            print("[Ground Truth] No fault_row for this file. "
+                  "Treat as normal flight.")
+        else:
+            idx = np.arange(num_steps)          # flatten 时间索引
+            i = idx // H_forecast               # 样本索引
+            h = idx % H_forecast                # 窗口内未来步索引
+            t = i + L + h                       # 对应原始 IMU 行号
 
-    # 标记真实故障区域
-    if np.sum(y_true) > 0:
-        plt.axvspan(failure_start_index, num_steps, alpha=0.1,
-                    label='Ground Truth Failure')
+            y_true = (t >= fault_row).astype(int)
+            print(f"[Ground Truth] fault_row = {fault_row}, "
+                  f"positive ratio = {y_true.mean():.3f}")
+        # ---- 先看全局 score 排序的上限能力 ----
+        scores_global = -np.log10(gamma_p_val + 1e-16)
 
-    plt.title(f"Diffusion+M2AD-area Detection: F1={f1:.3f} | Recall={rec:.3f}")
-    plt.xlabel("Time Index (sliding windows)")
-    plt.ylabel("-log10 Gamma p-value")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('final_result_p-gpt_m2ad_area.png')
-    plt.show()
-    print("Global visualization saved as 'final_result_p-gpt_m2ad_area.png'.")
+        auc_global = roc_auc_score(y_true, scores_global)
+        ap_global = average_precision_score(y_true, scores_global)
 
-    # ---------- 每个传感器单独的 ROC / PR 曲线 ----------
-    print("\n>>> Per-sensor ROC / PR analysis (based on sensor p-values).")
-    # 传感器级分数：score_sensor = -log10(p_val_sensor)
-    sensor_scores = -np.log10(p_val_sensors + 1e-16)  # [T, D]
+        best_gamma, best_f1, best_p, best_r = tune_gamma_by_f1(y_true, gamma_p_val)
 
-    for i, sensor in enumerate(train_dataset.features):
-        s = sensor_scores[:, i]
+        neg_scores = scores_global[y_true == 0]
+        pos_scores = scores_global[y_true == 1]
 
-        # ROC
-        fpr, tpr, _ = roc_curve(y_true, s)
-        roc_auc = auc(fpr, tpr)
+        print(f"[Global scores] ROC-AUC={auc_global:.4f}, "
+              f"AP={ap_global:.4f}")
+        print(f"[Score mean]   neg={neg_scores.mean():.3f}, "
+              f"pos={pos_scores.mean():.3f}")
+        print(f"[Oracle thr]   best_gamma={best_gamma:.3e}, "
+              f"F1={best_f1:.3f}, P={best_p:.3f}, R={best_r:.3f}")
 
-        # PR
-        precision_s, recall_s, _ = precision_recall_curve(y_true, s)
-        ap = average_precision_score(y_true, s)
+        # ---- 计算全局指标（多档 FPR） ----
+        print("\n" + "=" * 60)
+        print(f"Performance on {Path(test_file).name}")
+        print("=" * 60)
+        for fpr, gthr in gamma_thresh_list:
+            y_pred = (gamma_p_val < gthr).astype(int)
+            acc = accuracy_score(y_true, y_pred)
+            prec = precision_score(y_true, y_pred, zero_division=0)
+            rec = recall_score(y_true, y_pred, zero_division=0)
+            f1 = f1_score(y_true, y_pred, zero_division=0)
+            all_metrics[fpr].append((acc, prec, rec, f1))
+            print(f"FPR={fpr:.3%} | thr={gthr:.3e} | "
+                  f"Acc={acc:.2%} | P={prec:.2%} | R={rec:.2%} | F1={f1:.2%}")
+        print("=" * 60)
 
-        print(f"\n[Sensor: {sensor}] ROC-AUC={roc_auc:.4f}, AP={ap:.4f}")
+        # 默认绘图阈值使用中档 FPR（gamma_thresh_default）
+        y_pred_default = (gamma_p_val < gamma_thresh_default).astype(int)
+        f1_default = f1_score(y_true, y_pred_default, zero_division=0)
+        rec_default = recall_score(y_true, y_pred_default, zero_division=0)
 
-        plt.figure(figsize=(10, 4))
+        # ---- 全局分数可视化 ----
+        window_size = 5
+        smoothed_scores = pd.Series(scores_global).rolling(
+            window=window_size, min_periods=1
+        ).mean().values
 
-        # ROC 曲线
-        plt.subplot(1, 2, 1)
-        plt.plot(fpr, tpr, label=f'AUC={roc_auc:.3f}')
-        plt.plot([0, 1], [0, 1], linestyle='--')
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title(f'ROC - {sensor}')
+        plt.figure(figsize=(12, 6))
+        plt.plot(scores_global, label='Raw Score (-log10 p_gamma)')
+        plt.plot(smoothed_scores, linewidth=2,
+                 label=f'Smoothed Score (MA={window_size})')
+        plt.axhline(score_threshold, linestyle='--',
+                    label=f'Threshold (-log10 {gamma_thresh_default:.0e})')
+
+        # 标记真实故障区域（若存在）
+        if y_true.sum() > 0:
+            pos_indices = np.where(y_true == 1)[0]
+            first_pos = pos_indices[0]
+            last_pos = pos_indices[-1]
+            plt.axvspan(first_pos, last_pos, alpha=0.1,
+                        label='Ground Truth Failure')
+
+        plt.title(f"Diffusion+M2AD-area Detection: {Path(test_file).name} "
+                  f"| F1={f1_default:.3f} | Recall={rec_default:.3f}")
+        plt.xlabel("Time Index (sliding windows)")
+        plt.ylabel("-log10 Gamma p-value")
         plt.legend()
-
-        # PR 曲线
-        plt.subplot(1, 2, 2)
-        plt.plot(recall_s, precision_s, label=f'AP={ap:.3f}')
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title(f'PR - {sensor}')
-        plt.legend()
-
         plt.tight_layout()
-        fname = f'roc_pr_{sensor.replace(".", "_")}.png'
-        plt.savefig(fname)
+        fig_name = f'final_result_{Path(test_file).stem}_m2ad_area.png'
+        plt.savefig(fig_name)
         plt.close()
-        print(f"Saved per-sensor ROC/PR figure to '{fname}'.")
+        print(f"Global visualization saved as '{fig_name}'.")
+
+        # ---- 每个传感器 ROC / PR 曲线 ----
+        print("\n>>> Per-sensor ROC / PR analysis "
+              f"(file={Path(test_file).name}).")
+
+        sensor_scores = -np.log10(p_val_sensors + 1e-16)  # [T, D]
+
+        for i_sensor, sensor in enumerate(train_dataset.features):
+            s = sensor_scores[:, i_sensor]
+
+            # ROC
+            fpr, tpr, _ = roc_curve(y_true, s)
+            roc_auc_val = auc(fpr, tpr)
+
+            # PR
+            precision_s, recall_s, _ = precision_recall_curve(y_true, s)
+            ap_val = average_precision_score(y_true, s)
+
+            print(f"[Sensor: {sensor}] ROC-AUC={roc_auc_val:.4f}, "
+                  f"AP={ap_val:.4f}")
+
+            plt.figure(figsize=(10, 4))
+
+            # ROC 曲线
+            plt.subplot(1, 2, 1)
+            plt.plot(fpr, tpr, label=f'AUC={roc_auc_val:.3f}')
+            plt.plot([0, 1], [0, 1], linestyle='--')
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title(f'ROC - {sensor}')
+            plt.legend()
+
+            # PR 曲线
+            plt.subplot(1, 2, 2)
+            plt.plot(recall_s, precision_s, label=f'AP={ap_val:.3f}')
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.title(f'PR - {sensor}')
+            plt.legend()
+
+            plt.tight_layout()
+            sensor_fig = (
+                f'roc_pr_{Path(test_file).stem}_'
+                f'{sensor.replace(".", "_")}.png'
+            )
+            plt.savefig(sensor_fig)
+            plt.close()
+            print(f"Saved per-sensor ROC/PR figure to '{sensor_fig}'.")
+
+    # -------------------- 全部测试 flight 的总体统计 --------------------
+    if all_metrics:
+        print("\n" + "=" * 60)
+        print("Overall performance on all test flights")
+        print("=" * 60)
+        for fpr, metrics in all_metrics.items():
+            if not metrics:
+                continue
+            accs = [m[0] for m in metrics]
+            precs = [m[1] for m in metrics]
+            recs = [m[2] for m in metrics]
+            f1s = [m[3] for m in metrics]
+            print(f"FPR={fpr:.3%} | Acc={np.mean(accs):.2%} | "
+                  f"P={np.mean(precs):.2%} | R={np.mean(recs):.2%} | "
+                  f"F1={np.mean(f1s):.2%}")
+        print("=" * 60)
 
 
 if __name__ == "__main__":
