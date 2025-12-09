@@ -709,7 +709,7 @@ def main_alfa():
     # 序列长度
     L, H = 50, 20
     D_cond, D_target = 10, 10
-    train_epochs = 30
+    train_epochs = 300
 
     # 当前文件 P-Codex.py 的绝对路径
     THIS_FILE = Path(__file__).resolve()
