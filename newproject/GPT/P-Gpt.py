@@ -1318,7 +1318,7 @@ def main_alfa():
         )
         test_loader = DataLoader(
             test_dataset, batch_size=1, shuffle=False, num_workers=0,
-            pin_memory=pin_memory
+            pin_memory=True
         )
 
         # ---- 检测 ----
