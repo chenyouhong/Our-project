@@ -1274,9 +1274,8 @@ def main_alfa():
     error_name = 'area'  # 使用 AREA 误差
     MAX_CALIB_BATCHES = 50  # 比如只跑 50 个 batch (50 * 32 = 1600 样本)
     print(f"[Info] Limiting calibration to {MAX_CALIB_BATCHES} batches for speed.")
-
-    # 临时替换 loader 为切片版
-    limited_loader = itertools.islice(calib_loader, MAX_CALIB_BATCHES)
+    # 临时替换 loader 为切片版（转为 list 以支持 len() 和 tqdm）
+    limited_loader = list(itertools.islice(calib_loader, MAX_CALIB_BATCHES))
     gmm_model, fisher_thresh, calib_stats = fit_gmm_on_diffusion_errors(
         model=model,
         schedule=schedule,
