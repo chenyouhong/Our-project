@@ -1168,8 +1168,12 @@ def main_alfa():
     scaler = train_dataset.get_scaler()
 
     train_loader = DataLoader(
-        train_dataset, batch_size=32, shuffle=True, num_workers=0,
-        pin_memory=pin_memory
+        train_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,  # 建议修改为 4 或 8
+        pin_memory=True,
+        persistent_workers=True  # 保持 worker 进程存活
     )
 
     # 2) 校准 / 检测用：不需要标签，只要 (C_seq, Y_seq)
@@ -1210,6 +1214,11 @@ def main_alfa():
         ams_cfg=ams_cfg,
         d_model_future=ams_cfg["d_model"],
     ).to(device)
+    try:
+        print("Enabling torch.compile() for speedup...")
+        model = torch.compile(model)
+    except Exception as e:
+        print(f"Warning: torch.compile not available or failed: {e}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
@@ -1218,7 +1227,15 @@ def main_alfa():
     # -------------------- Phase 1: 训练或加载模型 --------------------
     if os.path.exists(model_path):
         print("\n>>> Phase 1: Loading pre-trained Diffusion model.")
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        state_dict = torch.load(model_path, map_location=device)
+
+        # 【修复逻辑】如果是编译后的模型，加载到 _orig_mod；否则直接加载
+        if hasattr(model, '_orig_mod'):
+            print("[Info] Loading state_dict into compiled model (_orig_mod)...")
+            model._orig_mod.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(state_dict)
+
         print(f"Loaded '{model_path}'.")
     else:
         print("\n>>> Phase 1: Training Diffusion+AMS+Classifier joint model from scratch.")
@@ -1250,7 +1267,10 @@ def main_alfa():
     # -------------------- Phase 2: M2AD 风格 GMM + Gamma 校准 --------------------
     print("\n>>> Phase 2: Calibrating GMM + Gamma on normal-like train data.")
     calib_loader = DataLoader(
-        train_dataset, batch_size=32, shuffle=False, num_workers=0,
+        calib_dataset,  # <--- 请确保改为 calib_dataset (返回2个值)
+        batch_size=32,
+        shuffle=False,
+        num_workers=0,
         pin_memory=pin_memory
     )
 
