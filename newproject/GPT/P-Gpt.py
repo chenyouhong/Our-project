@@ -51,7 +51,7 @@ if str(ROOT_DIR) not in sys.path:
 # 现在就可以 from MTCL_UAV... 了
 from MTCL_UAV.layers.MoE import MoE
 from MTCL_UAV.layers.RevIN import RevIN
-
+torch.set_float32_matmul_precision('high')
 # ======================================================================
 # 映射：测试集中每个 flight -> 对应的故障 IMU 行号（从 0 开始）
 # 你需要根据 ALFA 官方工具 / 自己整理的标注，把下面的字典填完整。
@@ -1214,12 +1214,11 @@ def main_alfa():
         ams_cfg=ams_cfg,
         d_model_future=ams_cfg["d_model"],
     ).to(device)
-    try:
-        print("Enabling torch.compile() for speedup...")
-        model = torch.compile(model)
-    except Exception as e:
-        print(f"Warning: torch.compile not available or failed: {e}")
-
+    # try:
+    #     print("Enabling torch.compile() for speedup...")
+    #     model = torch.compile(model)
+    # except Exception as e:
+    #     print(f"Warning: torch.compile not available or failed: {e}")
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     model_path = "uav_imputation_model.pth"
