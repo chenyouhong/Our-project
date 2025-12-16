@@ -1092,10 +1092,10 @@ def tune_gamma_by_f1(y_true, gamma_p_val):
 # ==================== 7. 主流程：训练 / 校准 / 测试 ====================
 def main_alfa():
     # -------------------- 设备与超参数 --------------------
-    # device = torch.device('xpu' if torch.xpu.is_available()
-    #                       else 'cuda' if torch.cuda.is_available()
-    #                       else 'cpu')
-    # print(f"Using device: {device}")
+    device = torch.device('xpu' if torch.xpu.is_available()
+                          else 'cuda' if torch.cuda.is_available()
+                          else 'cpu')
+    print(f"Using device: {device}")
     # 优先用 CUDA，其次 CPU，不再使用 XPU，避免 UR_RESULT_ERROR_OUT_OF_RESOURCES
     # if torch.cuda.is_available():
     #     device = torch.device('cuda')
@@ -1103,12 +1103,12 @@ def main_alfa():
     #     device = torch.device('cpu')
     # print(f"Using device: {device}")
     # 优先用 CUDA:0，其次 CPU，不再使用 XPU
-    if torch.cuda.is_available():
-        device = torch.device('cuda:0')
-    else:
-        device = torch.device('cpu')
-    print(f"Using device: {device}")
-    pin_memory = (device.type == 'cuda')
+    # if torch.cuda.is_available():
+    #     device = torch.device('cuda:0')
+    # else:
+    #     device = torch.device('cpu')
+    # print(f"Using device: {device}")
+    # pin_memory = (device.type == 'cuda')
 
     # 序列长度与维度
     L, H = 50, 20
@@ -1214,11 +1214,7 @@ def main_alfa():
         ams_cfg=ams_cfg,
         d_model_future=ams_cfg["d_model"],
     ).to(device)
-    # try:
-    #     print("Enabling torch.compile() for speedup...")
-    #     model = torch.compile(model)
-    # except Exception as e:
-    #     print(f"Warning: torch.compile not available or failed: {e}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     model_path = "uav_imputation_model.pth"
@@ -1270,7 +1266,7 @@ def main_alfa():
         batch_size=32,
         shuffle=False,
         num_workers=0,
-        pin_memory=pin_memory
+        pin_memory=True
     )
 
     error_name = 'area'  # 使用 AREA 误差
