@@ -10,7 +10,7 @@ This version:
 - Uses AREA errors (integral in a sliding window) to capture local energy changes.
 - Plots ROC / PR curves per sensor (10 IMU channels).
 """
-
+import itertools
 import math
 import os
 import glob
@@ -51,7 +51,7 @@ if str(ROOT_DIR) not in sys.path:
 # 现在就可以 from MTCL_UAV... 了
 from MTCL_UAV.layers.MoE import MoE
 from MTCL_UAV.layers.RevIN import RevIN
-torch.set_float32_matmul_precision('high')
+from tqdm import tqdm
 # ======================================================================
 # 映射：测试集中每个 flight -> 对应的故障 IMU 行号（从 0 开始）
 # 你需要根据 ALFA 官方工具 / 自己整理的标注，把下面的字典填完整。
@@ -947,6 +947,8 @@ def collect_diffusion_errors(model, schedule, loader, device,
 
     model.eval()
     with torch.no_grad():
+        # 【修改】用 tqdm 包裹 loader，显示进度条
+        print(f"[Info] Starting inference on {len(loader)} batches...")
         for C, Y_true in loader:
             C = C.to(device)           # [B, L, D]
             Y_true = Y_true.to(device) # [B, H, D]
@@ -1264,17 +1266,21 @@ def main_alfa():
     calib_loader = DataLoader(
         calib_dataset,  # <--- 请确保改为 calib_dataset (返回2个值)
         batch_size=32,
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
         pin_memory=True
     )
 
     error_name = 'area'  # 使用 AREA 误差
+    MAX_CALIB_BATCHES = 50  # 比如只跑 50 个 batch (50 * 32 = 1600 样本)
+    print(f"[Info] Limiting calibration to {MAX_CALIB_BATCHES} batches for speed.")
 
+    # 临时替换 loader 为切片版
+    limited_loader = itertools.islice(calib_loader, MAX_CALIB_BATCHES)
     gmm_model, fisher_thresh, calib_stats = fit_gmm_on_diffusion_errors(
         model=model,
         schedule=schedule,
-        loader=calib_loader,
+        loader=limited_loader,
         device=device,
         sensors=train_dataset.features,   # 10 个传感器
         error_name=error_name,
