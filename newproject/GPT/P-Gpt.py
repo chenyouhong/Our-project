@@ -52,6 +52,8 @@ if str(ROOT_DIR) not in sys.path:
 from MTCL_UAV.layers.MoE import MoE
 from MTCL_UAV.layers.RevIN import RevIN
 from tqdm import tqdm
+from __future__ import annotations
+from typing import Optional
 # ======================================================================
 # 映射：测试集中每个 flight -> 对应的故障 IMU 行号（从 0 开始）
 # 你需要根据 ALFA 官方工具 / 自己整理的标注，把下面的字典填完整。
@@ -314,6 +316,77 @@ class GaussianDiffusionSchedule(nn.Module):
         return mean + torch.sqrt(var) * noise
 
 
+@torch.no_grad()
+def ddim_sample(
+        model,
+        schedule,
+        C,
+        shape,
+        device,
+        steps=50,
+        eta=0.0
+):
+    """
+    DDIM Accelerated Sampling
+    Args:
+        model: UAVDiffusionModel
+        schedule: GaussianDiffusionSchedule instance
+        C: Condition (History) [B, L, D]
+        shape: Output shape (B, H, D)
+        device: torch device
+        steps: Sampling steps (e.g., 50)
+        eta: 0.0 for deterministic DDIM
+    Returns:
+        Y_pred: Predicted future trajectory [B, H, D]
+    """
+    model.eval()
+    B, H, D = shape
+
+    # 1. 生成跳步时间序列 (e.g., [999, 979, ..., 0])
+    total_steps = schedule.num_steps
+    times = torch.linspace(0, total_steps - 1, steps=steps).long().to(device)
+    times = torch.flip(times, [0])  # 倒序
+
+    # 2. 初始化噪声
+    img = torch.randn(shape, device=device)
+
+    # Self-conditioning placeholder
+    self_cond = torch.zeros_like(img)
+
+    # 3. DDIM Loop
+    # 使用 tqdm 显示进度 (可选，为了速度可移除 tqdm)
+    for i, step in enumerate(times):
+        # 当前时间步 t
+        t = torch.full((B,), step, device=device, dtype=torch.long)
+
+        # 下一个时间步 t_prev (即 t-1 在子序列中的位置)
+        prev_step = times[i + 1] if i < len(times) - 1 else -1
+
+        # 获取 alpha_bar 参数
+        alpha_bar_t = schedule.alpha_bars[step]
+        alpha_bar_prev = schedule.alpha_bars[prev_step] if prev_step >= 0 else torch.tensor(1.0, device=device)
+
+        # 4. 模型预测噪声 epsilon
+        # 注意：P-Gpt 模型 forward 需要 (C, Y_t, t, self_cond)
+        noise_pred = model(C, img, t, self_cond)
+
+        # 5. 预测 x0 (Predicted Clean Data)
+        pred_x0 = (img - torch.sqrt(1 - alpha_bar_t) * noise_pred) / torch.sqrt(alpha_bar_t)
+
+        # 更新 self_cond (如果模型训练时用了 self-conditioning)
+        self_cond = pred_x0.detach()
+
+        # 6. 计算方向 (Direction pointing to x_t)
+        sigma_t = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev))
+        # 对于 DDIM (eta=0)，sigma_t 为 0
+
+        pred_dir_xt = torch.sqrt(1 - alpha_bar_prev - sigma_t ** 2) * noise_pred
+
+        # 7. 更新 x_{t-1}
+        noise = torch.randn_like(img) if sigma_t > 0 else 0.
+        img = torch.sqrt(alpha_bar_prev) * pred_x0 + pred_dir_xt + sigma_t * noise
+
+    return img
 # ==================== 3. Transformer + Diffusion 架构 ====================
 class AMSCondEncoder(nn.Module):
     """
@@ -706,6 +779,99 @@ def impute_future_trajectory(model, schedule, C, Y_obs, mask, device):
         Y_t = mask * Y_obs_t + (1.0 - mask) * Y_prev
 
     return Y_t
+@torch.no_grad()
+def impute_future_trajectory_ddim(
+    model: torch.nn.Module,
+    schedule,  # GaussianDiffusionSchedule
+    C: torch.Tensor,
+    Y_obs: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    sample_steps: int = 50,
+    use_autocast: bool = True,
+) -> torch.Tensor:
+    """
+    Fast future trajectory generation using strided DDIM sampling (eta=0).
+
+    Args:
+        model: UAVDiffusionModel-like module. Signature: model(C, Y_t, t, self_cond) -> eps_pred.
+        schedule: GaussianDiffusionSchedule, must provide alpha_bars (buffer) and num_steps.
+        C: [B, L, D] history sequence.
+        Y_obs: [B, H, D] observed future (can be zeros).
+        mask: [B, H, D] 1 for observed dims, 0 for unknown dims.
+        device: torch.device.
+        sample_steps: number of DDIM steps used in sampling (<= schedule.num_steps).
+        use_autocast: enable AMP autocast for cuda/cpu.
+
+    Returns:
+        Y0_hat: [B, H, D] sampled future sequence.
+    """
+    assert C.device == device and Y_obs.device == device and mask.device == device, \
+        "C/Y_obs/mask must be moved to `device` before calling."
+
+    num_steps = int(schedule.num_steps)
+    sample_steps = int(sample_steps)
+    if sample_steps <= 0:
+        raise ValueError("sample_steps must be positive.")
+    if sample_steps > num_steps:
+        sample_steps = num_steps
+
+    B, H, D = Y_obs.shape
+    Y_t = torch.randn_like(Y_obs)  # x_T
+    self_cond = torch.zeros_like(Y_obs)
+
+    # Strided timesteps: e.g., 999 -> ... -> 0
+    t_seq = torch.linspace(num_steps - 1, 0, steps=sample_steps, device=device).long()
+    alpha_bars = schedule.alpha_bars  # buffer already on device if schedule.to(device) was called
+
+    mask_is_all_zero = bool(torch.count_nonzero(mask).item() == 0)
+
+    # AMP context (safe only for cuda/cpu; xpu 环境建议先关掉 use_autocast)
+    amp_enabled = use_autocast and device.type in ("cuda", "cpu")
+    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+
+    def _step_body(t_now: int, t_prev: int, y_t: torch.Tensor, sc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        t = torch.full((B,), t_now, device=device, dtype=torch.long)
+        eps_pred = model(C, y_t, t, sc)
+
+        a_t = alpha_bars[t_now]
+        a_prev = torch.tensor(1.0, device=device) if t_prev < 0 else alpha_bars[t_prev]
+
+        # x0 = (x_t - sqrt(1-a_t)*eps) / sqrt(a_t)
+        x0 = (y_t - torch.sqrt(1.0 - a_t) * eps_pred) / torch.sqrt(a_t)
+
+        # DDIM (eta=0): x_{t_prev} = sqrt(a_prev)*x0 + sqrt(1-a_prev)*eps_pred
+        y_prev = torch.sqrt(a_prev) * x0 + torch.sqrt(1.0 - a_prev) * eps_pred
+        return y_prev, x0
+
+    for i in range(len(t_seq)):
+        t_now = int(t_seq[i].item())
+        t_prev = -1 if i == len(t_seq) - 1 else int(t_seq[i + 1].item())
+
+        if amp_enabled:
+            with torch.autocast(device_type=device.type, dtype=amp_dtype):
+                Y_prev, x0_pred = _step_body(t_now, t_prev, Y_t, self_cond)
+        else:
+            Y_prev, x0_pred = _step_body(t_now, t_prev, Y_t, self_cond)
+
+        self_cond = x0_pred.detach()
+
+        # 如果是纯预测（mask 全 0），直接用 Y_prev（最快）
+        if mask_is_all_zero:
+            Y_t = Y_prev
+            continue
+
+        # 否则保持与你原 RePaint 一致：在 t_prev 注入观测（注意：t_prev=-1 表示最终 x0）
+        if t_prev >= 0:
+            noise = torch.randn_like(Y_obs)
+            t_prev_tensor = torch.full((B,), t_prev, device=device, dtype=torch.long)
+            Y_obs_t = schedule.q_sample(Y_obs, t_prev_tensor, noise)
+        else:
+            Y_obs_t = Y_obs
+
+        Y_t = mask * Y_obs_t + (1.0 - mask) * Y_prev
+
+    return Y_t
 
 
 # ==================== 5. M2AD 风格多传感器统计模块 ====================
@@ -957,7 +1123,17 @@ def collect_diffusion_errors(model, schedule, loader, device,
             Y_obs = torch.zeros_like(Y_true)
             mask = torch.zeros_like(Y_true)
 
-            Y_pred = impute_future_trajectory(model, schedule, C, Y_obs, mask, device)
+            # Y_pred = impute_future_trajectory(model, schedule, C, Y_obs, mask, device)
+            Y_pred = impute_future_trajectory_ddim(
+                model=model,
+                schedule=schedule,
+                C=C,
+                Y_obs=Y_obs,
+                mask=mask,
+                device=device,
+                sample_steps=50,  # 关键：从 1000 降到 50
+                use_autocast=False,  # 若你是 xpu 环境，建议先 False；cuda 可改 True
+            )
 
             # 展开到 [B*H, D]，拼接到全局时间序列
             B, H, D = Y_true.shape
