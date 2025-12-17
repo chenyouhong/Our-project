@@ -1448,7 +1448,7 @@ def main_alfa():
     )
 
     error_name = 'area'  # 使用 AREA 误差
-    MAX_CALIB_BATCHES = 10  # 比如只跑 50 个 batch (50 * 32 = 1600 样本),实际只有34个
+    MAX_CALIB_BATCHES =34  # 比如只跑 50 个 batch (50 * 32 = 1600 样本),实际只有34个
     print(f"[Info] Limiting calibration to {MAX_CALIB_BATCHES} batches for speed.")
     # 临时替换 loader 为切片版（转为 list 以支持 len() 和 tqdm）
     limited_loader = list(itertools.islice(calib_loader, MAX_CALIB_BATCHES))
@@ -1493,8 +1493,8 @@ def main_alfa():
             [test_file], mode='test', scaler=scaler, L=L, H=H
         )
         test_loader = DataLoader(
-            test_dataset, batch_size=1, shuffle=False, num_workers=0,
-            pin_memory=True
+            test_dataset, batch_size=64, shuffle=False, num_workers=0,
+            pin_memory=(device.type == "cuda"),
         )
 
         # ---- 检测 ----
