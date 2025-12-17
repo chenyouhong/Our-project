@@ -36,7 +36,7 @@ from scipy.stats import gamma
 from sklearn.mixture import GaussianMixture
 from functools import partial
 from itertools import compress
-
+from __future__ import annotations
 import sys
 
 THIS_FILE = Path(__file__).resolve()
@@ -52,7 +52,7 @@ if str(ROOT_DIR) not in sys.path:
 from MTCL_UAV.layers.MoE import MoE
 from MTCL_UAV.layers.RevIN import RevIN
 from tqdm import tqdm
-from __future__ import annotations
+
 from typing import Optional
 # ======================================================================
 # 映射：测试集中每个 flight -> 对应的故障 IMU 行号（从 0 开始）
@@ -1269,201 +1269,117 @@ def tune_gamma_by_f1(y_true, gamma_p_val):
 
 # ==================== 7. 主流程：训练 / 校准 / 测试 ====================
 def main_alfa():
-    # -------------------- 设备与超参数 --------------------
-    device = torch.device('xpu' if torch.xpu.is_available()
-                          else 'cuda' if torch.cuda.is_available()
-                          else 'cpu')
-    print(f"Using device: {device}")
-    # 优先用 CUDA，其次 CPU，不再使用 XPU，避免 UR_RESULT_ERROR_OUT_OF_RESOURCES
-    # if torch.cuda.is_available():
-    #     device = torch.device('cuda')
-    # else:
-    #     device = torch.device('cpu')
-    # print(f"Using device: {device}")
-    # 优先用 CUDA:0，其次 CPU，不再使用 XPU
-    # if torch.cuda.is_available():
-    #     device = torch.device('cuda:0')
-    # else:
-    #     device = torch.device('cpu')
-    # print(f"Using device: {device}")
-    # pin_memory = (device.type == 'cuda')
+    args = parse_args()
+    set_seed(args.seed)
 
-    # 序列长度与维度
+    # Device selection
+    if args.device == "auto":
+        device = get_device(prefer_cuda=True)
+    else:
+        device = torch.device(args.device)
+    print(f"Using device: {device}")
+
+    # Hyperparams
     L, H = 50, 20
     D_cond, D_target = 10, 10
-
     train_epochs = 300
     diffusion_steps = 1000
 
-    # -------------------- 路径配置 --------------------
+    # Paths
     THIS_FILE = Path(__file__).resolve()
-    ROOT_DIR = THIS_FILE.parents[2]        # OurProject 根目录
+    ROOT_DIR = THIS_FILE.parents[2]
     DATA_ROOT = ROOT_DIR / "data" / "alfa"
     train_dir = DATA_ROOT / "train"
     test_dir = DATA_ROOT / "test"
 
-    # 递归查找所有 mavros-imu-data.csv
     train_files = list(train_dir.rglob("mavros-imu-data.csv"))
     test_files = list(test_dir.rglob("mavros-imu-data.csv"))
-
     if not train_files:
         raise RuntimeError(f"Error: No train files found in {train_dir}")
     if not test_files:
         raise RuntimeError(f"Error: No test files found in {test_dir}")
-
     print(f"Found {len(train_files)} train files, {len(test_files)} test files.")
-    # -------- 只挑 2 条带故障的 test flight 做调试 --------
-    # 利用 FAULT_ROW_DICT 的 key 来判断“带故障”的 flight
+
+    # pick faulty test flights
     faulty_test_files = []
     for f in test_files:
         s = str(f)
         if any(key in s for key in FAULT_ROW_DICT.keys()):
             faulty_test_files.append(f)
-
-    # 去重并只保留前两条
     faulty_test_files = list(dict.fromkeys(faulty_test_files))
     if len(faulty_test_files) == 0:
         raise RuntimeError("No faulty test flights found that match FAULT_ROW_DICT keys.")
-    test_files = faulty_test_files[:1]
-
-    print("Debug mode: using only 1 faulty test flights:")
+    test_files = faulty_test_files[: min(args.num_test_flights, len(faulty_test_files))]
+    print("Debug mode: using the following test flights:")
     for f in test_files:
-        print("  ", f)
+        print(" ", f)
 
-
-    # -------------------- 数据集与 DataLoader --------------------
+    # Datasets & Loaders
     print("Loading train data and fitting scaler...")
-
-    # 1) 训练用：需要分类标签
-    train_dataset = ALFADataset(
-        train_files,
-        mode='train',
-        scaler=None,
-        L=L,
-        H=H,
-        return_label=True,  # 关键：返回 y_cls
-    )
+    train_dataset = ALFADataset(train_files, mode='train', scaler=None, L=L, H=H, return_label=True)
     scaler = train_dataset.get_scaler()
+    num_workers = max(0, args.num_workers)
+    persistent = True if num_workers > 0 else False
+
+    def _worker_init_fn(worker_id):
+        seed = args.seed + worker_id + 1
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=32,
-        shuffle=True,
-        num_workers=4,  # 建议修改为 4 或 8
-        pin_memory=True,
-        persistent_workers=True  # 保持 worker 进程存活
+        train_dataset, batch_size=32, shuffle=True,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=persistent,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None
     )
 
-    # 2) 校准 / 检测用：不需要标签，只要 (C_seq, Y_seq)
-    calib_dataset = ALFADataset(
-        train_files,
-        mode='train',
-        scaler=scaler,  # 复用同一个 scaler
-        L=L,
-        H=H,
-        return_label=False,
-    )
-
-    # -------------------- 模型与 Diffusion + AMS Joint Backbone --------------------
+    calib_dataset = ALFADataset(train_files, mode='train', scaler=scaler, L=L, H=H, return_label=False)
+    # model & schedule
     cfg = DiffusionConfig(num_steps=diffusion_steps)
     schedule = GaussianDiffusionSchedule(cfg).to(device)
+    ams_cfg = {"device": device, "d_model": 128, "d_ff": 256, "layer_nums": 2, "k": 2,
+               "num_experts_list": [4, 4], "patch_size_list": [10,5,2,1,10,5,2,1],
+               "residual_connection": True, "use_revin": True, "batch_norm": True, "temp": 2.0}
 
-    ams_cfg = {
-        "device": device,
-        "d_model": 128,
-        "d_ff": 256,
-        "layer_nums": 2,
-        "k": 2,
-        "num_experts_list": [4, 4],
-        # 显式指定 patch_size_list：每层 [10, 5, 2, 1]
-        # 注意：这是 flat list，AMSCondEncoder 内部会 reshape 成 (2, 4)
-        "patch_size_list": [10, 5, 2, 1, 10, 5, 2, 1],
-        "residual_connection": True,
-        "use_revin": True,
-        "batch_norm": True,
-        "temp": 2.0,
-    }
-
-    model = UAVDiffusionModel(
-        D_cond=D_cond,
-        D_target=D_target,
-        diffusion_cfg=cfg,
-        L_hist=L,  # 这里用历史长度 L=50
-        ams_cfg=ams_cfg,
-        d_model_future=ams_cfg["d_model"],
-    ).to(device)
-
+    model = UAVDiffusionModel(D_cond=D_cond, D_target=D_target, diffusion_cfg=cfg,
+                              L_hist=L, ams_cfg=ams_cfg, d_model_future=ams_cfg["d_model"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
     model_path = "uav_imputation_model.pth"
 
-    # -------------------- Phase 1: 训练或加载模型 --------------------
+    # Load or train
     if os.path.exists(model_path):
-        print("\n>>> Phase 1: Loading pre-trained Diffusion model.")
+        print(">>> Phase 1: Loading pre-trained Diffusion model.")
         state_dict = torch.load(model_path, map_location=device)
-
-        # 【修复逻辑】如果是编译后的模型，加载到 _orig_mod；否则直接加载
         if hasattr(model, '_orig_mod'):
-            print("[Info] Loading state_dict into compiled model (_orig_mod)...")
             model._orig_mod.load_state_dict(state_dict)
         else:
             model.load_state_dict(state_dict)
-
         print(f"Loaded '{model_path}'.")
     else:
-        print("\n>>> Phase 1: Training Diffusion+AMS+Classifier joint model from scratch.")
+        print(">>> Phase 1: Training Diffusion+AMS+Classifier joint model from scratch.")
         for epoch in range(train_epochs):
             total_loss = 0.0
             for C_batch, Y_batch, y_cls in train_loader:
-                stats = training_step(
-                    model,
-                    schedule,
-                    C_batch,
-                    Y_batch,
-                    optimizer,
-                    device,
-                    lambda_balance=1.0,
-                    lambda_contrast=0.1,
-                    lambda_cls=0.5,  # 你可以之后调这个权重
-                    y_cls=y_cls,
-                )
+                stats = training_step(model, schedule, C_batch, Y_batch, optimizer, device,
+                                      lambda_balance=1.0, lambda_contrast=0.1, lambda_cls=0.5, y_cls=y_cls)
                 total_loss += stats["loss_total"]
-            print(
-                f"Epoch {epoch + 1}/{train_epochs}, "
-                f"Avg Loss: {total_loss / len(train_loader):.6f}"
-            )
+            print(f"Epoch {epoch + 1}/{train_epochs}, Avg Loss: {total_loss / len(train_loader):.6f}")
         torch.save(model.state_dict(), model_path)
         print(f"Saved trained model to '{model_path}'.")
 
-    model.eval()
-
-    # -------------------- Phase 2: M2AD 风格 GMM + Gamma 校准 --------------------
-    print("\n>>> Phase 2: Calibrating GMM + Gamma on normal-like train data.")
-    calib_loader = DataLoader(
-        calib_dataset,  # <--- 请确保改为 calib_dataset (返回2个值)
-        batch_size=32,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True
-    )
-
-    error_name = 'area'  # 使用 AREA 误差
-    MAX_CALIB_BATCHES = 50  # 比如只跑 50 个 batch (50 * 32 = 1600 样本)
-    print(f"[Info] Limiting calibration to {MAX_CALIB_BATCHES} batches for speed.")
-    # 临时替换 loader 为切片版（转为 list 以支持 len() 和 tqdm）
-    limited_loader = list(itertools.islice(calib_loader, MAX_CALIB_BATCHES))
+    # Calibration: use limited batches or disk-based collection
+    print(">>> Phase 2: Calibrating GMM + Gamma on normal-like train data.")
+    calib_loader = DataLoader(calib_dataset, batch_size=32, shuffle=True, num_workers=0, pin_memory=True)
+    limited_loader = list(itertools.islice(calib_loader, args.max_calib_batches))
     gmm_model, fisher_thresh, calib_stats = fit_gmm_on_diffusion_errors(
-        model=model,
-        schedule=schedule,
-        loader=limited_loader,
-        device=device,
-        sensors=train_dataset.features,   # 10 个传感器
-        error_name=error_name,
-        n_components=1,
-        covariance_type='spherical',
-        score_window=10,
-        smoothing_window=10,
+        model=model, schedule=schedule, loader=limited_loader, device=device,
+        sensors=train_dataset.features, error_name='area', n_components=1,
+        covariance_type='spherical', score_window=10, smoothing_window=10
     )
+    # ... 后续保持不变 ...
+
 
     calib_errors, calib_gamma_pval, calib_fisher = calib_stats
     # 在“正常”校准数据上希望的假报警率（可尝试多档）
